@@ -1,86 +1,95 @@
 import { Request, Response } from 'express';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import s3 from '../config/aws';
-import { users, fileShares } from '../models/userModel';
-import nodemailer from 'nodemailer';
+import prisma from '../prisma';
 import fs from 'fs';
 
 export const uploadFile = async (req: Request, res: Response) => {
-    const fileContent = fs.readFileSync(req.file.path);
-    const { email } = req.user;
-
-    const params = {
-        Bucket: process.env.AWS_BUCKET_NAME as string,
-        Key: `${email}/${req.file.originalname}`,
-        Body: fileContent,
-    };
-
     try {
+        if (!req.file) {
+            console.error('No file found in the request');
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        const { userId } = req.user;
+        const fileContent = fs.readFileSync(req.file.path);
+        const filename = req.file.originalname;
+        const size = req.file.size;
+
+        // Upload file to S3
+        const params = {
+            Bucket: process.env.AWS_BUCKET_NAME as string,
+            Key: `${userId}/${filename}`,
+            Body: fileContent,
+        };
+
         const command = new PutObjectCommand(params);
         await s3.send(command);
 
-        const fileMetadata = {
-            filename: req.file.originalname,
-            createdAt: new Date(),
-            size: req.file.size,
-            url: `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${email}/${req.file.originalname}`,
-        };
+        // Store file metadata in the database
+        const file = await prisma.file.create({
+            data: {
+                filename,
+                size,
+                url: `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${userId}/${filename}`,
+                userId,
+            },
+        });
 
-        users[email].files.push(fileMetadata);
-        res.json(fileMetadata);
+        res.json(file);
     } catch (error) {
-        res.status(500).send(error);
+        console.error('Error during file upload:', error);
+        res.status(403).json({ error: 'Forbidden', details: error.message });
     }
 };
 
-export const viewMyFiles = (req: Request, res: Response) => {
-    const { email } = req.user;
-    res.json(users[email].files);
-};
+export const getFile = async (req: Request, res: Response) => {
+    const { userId } = req.user;
+    const { filename } = req.params;
 
-export const shareFile = async (req: Request, res: Response) => {
-    const { recipientEmail, fileId } = req.body;
-    const { email } = req.user;
-
-    if (!users[recipientEmail]) return res.status(404).send('Recipient not found');
-    if (!users[email].files.some((file) => file.filename === fileId)) return res.status(403).send('File not found');
-
-    if (!fileShares[fileId]) fileShares[fileId] = [];
-    fileShares[fileId].push(recipientEmail);
-
-    const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASS,
-        },
+    // Find the file in the database
+    const file = await prisma.file.findFirst({
+        where: { filename, userId },
     });
 
-    const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: recipientEmail,
-        subject: 'File Shared with You',
-        text: `A file has been shared with you. Access it here: http://yourapp.com/shared-files/${fileId}`,
-    };
-
-    await transporter.sendMail(mailOptions);
-    res.status(200).send('File shared successfully');
-};
-
-export const getFile = async (req: Request, res: Response) => {
-    const { email } = req.user;
-    const { filename } = req.params;
+    if (!file) return res.status(404).json({ error: 'File not found' });
 
     const params = {
         Bucket: process.env.AWS_BUCKET_NAME as string,
-        Key: `${email}/${filename}`,
+        Key: `${userId}/${filename}`,
     };
 
     try {
         const command = new GetObjectCommand(params);
         const data = await s3.send(command);
-        data.Body.pipe(res); // Stream data directly to the response
+
+        data.Body.pipe(res);
     } catch (error) {
-        res.status(500).send(error);
+        console.error('Error retrieving file:', error);
+        res.status(500).json({ error: 'Error retrieving file' });
     }
 };
+
+export const getMyFiles = async (req: Request, res: Response) => {
+    try {
+        const { userId } = req.user;
+
+        // Fetch files from the database associated with the user
+        const files = await prisma.file.findMany({
+            where: { userId },
+            select: {
+                id: true,
+                filename: true,
+                createdAt: true,
+                size: true,
+                url: true,
+            },
+        });
+
+        res.json(files);
+    } catch (error) {
+        console.error('Error retrieving files:', error);
+        res.status(500).json({ error: 'Error retrieving files' });
+    }
+};
+
